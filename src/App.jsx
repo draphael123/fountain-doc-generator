@@ -1,4 +1,6 @@
 import { useState, useRef, useEffect } from "react";
+import html2canvas from "html2canvas";
+import { jsPDF } from "jspdf";
 
 const BASE = (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.BASE_URL) ? import.meta.env.BASE_URL : "/";
 const HRT_BG = `${BASE}hrt_letterhead.png`;
@@ -130,13 +132,24 @@ export default function App() {
   const [savedDraft, setSavedDraft]             = useState(null);
   const [copyStatus, setCopyStatus]            = useState(null); // "copied" | "failed" | null
   const [pdfNote, setPdfNote]                  = useState(false);
+  const [previewScale, setPreviewScale]        = useState(() => {
+    try { const v = localStorage.getItem("fountain_preview_scale"); if (v) return Math.max(0.6, Math.min(1.5, Number(v))); } catch (_) {}
+    return 1;
+  });
   const previewRef = useRef();
+  const previewScrollRef = useRef();
+  const previewZoomWrapperRef = useRef();
   const mainContentRef = useRef();
 
   // ── Persist dark mode ─────────────────────────────────────────────────────
   useEffect(() => {
     try { localStorage.setItem("fountain_dark", dark ? "true" : "false"); } catch (_) {}
   }, [dark]);
+
+  // ── Persist preview zoom ──────────────────────────────────────────────────
+  useEffect(() => {
+    try { localStorage.setItem("fountain_preview_scale", String(previewScale)); } catch (_) {}
+  }, [previewScale]);
 
   // ── Auto-save / restore ──────────────────────────────────────────────────
   useEffect(() => {
@@ -229,19 +242,44 @@ export default function App() {
     setSelectedSignerId(null);
   };
 
-  const handleExportPDF = () => {
-    const content = previewRef.current?.innerHTML;
-    if (!content) return;
-    const win = window.open("", "_blank");
-    win.document.write(
-      `<!DOCTYPE html><html><head><title>Fountain Letter</title>
-       <style>*{margin:0;padding:0;box-sizing:border-box;}body{background:white;}
-       @media print{@page{margin:0;}}</style>
-       </head><body>${content}<script>window.onload=function(){window.print();}<\/script></body></html>`
-    );
-    win.document.close();
+  const scrollPreviewTo = (position) => {
+    const el = previewScrollRef.current;
+    if (!el) return;
+    el.scrollTo({ top: position === "first" ? 0 : el.scrollHeight, behavior: "smooth" });
+  };
+
+  const handleExportPDF = async () => {
+    const container = previewRef.current;
+    if (!container || !container.children.length) return;
     setPdfNote(true);
-    setTimeout(() => setPdfNote(false), 6000);
+    const zoomWrapper = previewZoomWrapperRef.current;
+    if (zoomWrapper) zoomWrapper.style.zoom = "1";
+    try {
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const pdf = new jsPDF("p", "pt", "a4");
+      const a4W = pdf.internal.pageSize.getWidth();
+      const a4H = pdf.internal.pageSize.getHeight();
+      for (let i = 0; i < container.children.length; i++) {
+        const pageEl = container.children[i];
+        const canvas = await html2canvas(pageEl, {
+          scale: 2,
+          useCORS: true,
+          logging: false,
+          backgroundColor: "#ffffff",
+        });
+        const imgW = a4W;
+        const imgH = (canvas.height * a4W) / canvas.width;
+        if (i > 0) pdf.addPage();
+        pdf.addImage(canvas.toDataURL("image/png"), "PNG", 0, 0, imgW, Math.min(imgH, a4H));
+      }
+      pdf.save(`fountain-${template.toLowerCase()}-letter-${dateStr}.pdf`);
+    } catch (_) {
+      if (zoomWrapper) zoomWrapper.style.zoom = String(previewScale);
+      setPdfNote(false);
+      return;
+    }
+    if (zoomWrapper) zoomWrapper.style.zoom = String(previewScale);
+    setPdfNote(false);
   };
 
   const handleExportWord = () => {
@@ -256,6 +294,54 @@ export default function App() {
     const a = document.createElement("a");
     a.href = url;
     a.download = `fountain-${template.toLowerCase()}-letter-${dateStr}.doc`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const exportFilename = (ext) => `fountain-${template.toLowerCase()}-letter-${dateStr}.${ext}`;
+
+  const handleExportText = () => {
+    let text = body || "";
+    if (activeSigner) text += (text ? "\n\n" : "") + `${activeSigner.name}\n${activeSigner.title}`;
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = exportFilename("txt");
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const escapeRtf = (s) => String(s || "").replace(/\\/g, "\\\\").replace(/{/g, "\\{").replace(/}/g, "\\}");
+  const handleExportRTF = () => {
+    const parts = ["{\\rtf1\\ansi\\deff0", "{\\fonttbl{\\f0 Times New Roman;}}", "\\f0\\fs24"];
+    const escaped = escapeRtf(body).replace(/\n/g, "\\par\n");
+    parts.push(escaped);
+    if (activeSigner) {
+      parts.push("\\par\\par");
+      parts.push("\\b " + escapeRtf(activeSigner.name) + "\\b0\\par");
+      parts.push(escapeRtf(activeSigner.title));
+    }
+    parts.push("}");
+    const blob = new Blob([parts.join("\n")], { type: "application/rtf" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = exportFilename("rtf");
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleExportHTML = () => {
+    const content = previewRef.current?.innerHTML;
+    if (!content) return;
+    const doc = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Fountain Letter</title><style>body{font-family:Georgia,serif;max-width:720px;margin:24px auto;padding:0 16px;}</style></head><body>${content}</body></html>`;
+    const blob = new Blob([doc], { type: "text/html;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = exportFilename("html");
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -322,8 +408,11 @@ export default function App() {
           </button>
           {section === "generator" && (
             <>
-              <button onClick={handleExportWord} style={{ padding: "7px 14px", borderRadius: "8px", border: `1px solid ${T.wordBtn.border}`, background: "transparent", color: T.wordBtn.color, fontSize: "12px", cursor: "pointer", fontWeight: "500" }}>⬇ Word</button>
-              <button onClick={handleExportPDF}  style={{ padding: "7px 18px", borderRadius: "8px", border: "none", background: accentGrad, color: "white", fontSize: "12px", cursor: "pointer", fontWeight: "600" }}>⬇ PDF</button>
+              <button type="button" onClick={handleExportWord} style={{ padding: "7px 12px", borderRadius: "8px", border: `1px solid ${T.wordBtn.border}`, background: "transparent", color: T.wordBtn.color, fontSize: "12px", cursor: "pointer", fontWeight: "500" }}>⬇ Word</button>
+              <button type="button" onClick={handleExportText} style={{ padding: "7px 12px", borderRadius: "8px", border: `1px solid ${T.wordBtn.border}`, background: "transparent", color: T.wordBtn.color, fontSize: "12px", cursor: "pointer", fontWeight: "500" }}>⬇ Text</button>
+              <button type="button" onClick={handleExportRTF} style={{ padding: "7px 12px", borderRadius: "8px", border: `1px solid ${T.wordBtn.border}`, background: "transparent", color: T.wordBtn.color, fontSize: "12px", cursor: "pointer", fontWeight: "500" }}>⬇ RTF</button>
+              <button type="button" onClick={handleExportHTML} style={{ padding: "7px 12px", borderRadius: "8px", border: `1px solid ${T.wordBtn.border}`, background: "transparent", color: T.wordBtn.color, fontSize: "12px", cursor: "pointer", fontWeight: "500" }}>⬇ HTML</button>
+              <button type="button" onClick={handleExportPDF} style={{ padding: "7px 18px", borderRadius: "8px", border: "none", background: accentGrad, color: "white", fontSize: "12px", cursor: "pointer", fontWeight: "600" }}>⬇ PDF</button>
             </>
           )}
         </div>
@@ -346,7 +435,7 @@ export default function App() {
       {pdfNote && section === "generator" && (
         <div style={{ background: dark ? "#1e3a5f" : "#dbeafe", borderBottom: `1px solid ${dark ? "#2563eb" : "#93c5fd"}`, padding: "8px 24px", flexShrink: 0 }}>
           <span style={{ fontSize: "12.5px", color: dark ? "#93c5fd" : "#1d4ed8" }}>
-            Use the print dialog in the new tab to save as PDF, then you can close that tab.
+            Preparing PDF download…
           </span>
         </div>
       )}
@@ -493,32 +582,52 @@ export default function App() {
           </div>
 
           {/* Preview */}
-          <div style={{ flex: 1, background: T.preview, overflow: "auto", display: "flex", flexDirection: "column", alignItems: "center", padding: "28px 24px", transition: "background 0.3s" }}>
-            <div style={{ fontSize: "10px", color: T.previewLabel, fontWeight: "700", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: "14px", alignSelf: "flex-start", paddingLeft: "4px" }}>
-              Preview · {template} Letterhead{isMultiPage ? ` · ${pages.length} pages` : ""}
+          <div
+            ref={previewScrollRef}
+            role="region"
+            aria-label="Letter preview"
+            style={{ flex: 1, background: T.preview, overflow: "auto", display: "flex", flexDirection: "column", alignItems: "center", padding: "28px 24px", transition: "background 0.3s" }}
+          >
+            <div style={{ position: "sticky", top: 0, zIndex: 2, background: T.preview, paddingBottom: "12px", marginBottom: "4px", width: "100%", maxWidth: "720px", display: "flex", flexDirection: "column", gap: "10px", alignItems: "stretch" }}>
+              <div style={{ fontSize: "10px", color: T.previewLabel, fontWeight: "700", letterSpacing: "0.12em", textTransform: "uppercase", paddingLeft: "4px" }}>
+                Preview · {template} Letterhead{isMultiPage ? ` · ${pages.length} pages` : ""}
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center" }}>
+                <button type="button" onClick={() => scrollPreviewTo("first")} aria-label="Scroll to first page" style={{ padding: "5px 10px", borderRadius: "6px", border: `1px solid ${T.border}`, background: T.panel, color: T.textMuted, fontSize: "11px", cursor: "pointer", fontWeight: "500" }}>↑ First page</button>
+                <button type="button" onClick={() => scrollPreviewTo("last")} aria-label="Scroll to last page" style={{ padding: "5px 10px", borderRadius: "6px", border: `1px solid ${T.border}`, background: T.panel, color: T.textMuted, fontSize: "11px", cursor: "pointer", fontWeight: "500" }}>↓ Last page</button>
+                <span style={{ width: "1px", height: "18px", background: T.border, marginLeft: "4px" }} />
+                <span style={{ fontSize: "11px", color: T.previewLabel, marginRight: "4px" }}>Zoom:</span>
+                {[0.8, 1, 1.25].map((s) => (
+                  <button key={s} type="button" onClick={() => setPreviewScale(s)} aria-label={`Zoom ${s * 100}%`} aria-pressed={previewScale === s} style={{ padding: "5px 10px", borderRadius: "6px", border: `1px solid ${previewScale === s ? accent : T.border}`, background: previewScale === s ? (dark ? "rgba(13,110,253,0.2)" : "#e8f0fe") : T.panel, color: previewScale === s ? accent : T.textMuted, fontSize: "11px", cursor: "pointer", fontWeight: "500" }}>
+                    {s === 1 ? "100%" : `${s * 100}%`}
+                  </button>
+                ))}
+              </div>
             </div>
 
-            <div ref={previewRef} style={{ width: "100%", maxWidth: "720px", display: "flex", flexDirection: "column", gap: "12px" }}>
-              {pages.map((pageBody, i) => {
-                const isFirst = i === 0;
-                const isLast  = i === pages.length - 1;
-                return (
-                  <div key={i} style={{ boxShadow: pageShadow, borderRadius: "3px", overflow: "hidden" }}>
-                    {isFirst ? (
-                      <LetterheadPage
-                        bg={isHRT ? HRT_BG : TRT_BG}
-                        body={pageBody}
-                        signer={activeSigner}
-                        headerEndPct={isHRT ? 22 : 14.5}
-                        footerStartPct={89.9}
-                        isLastPage={isLast}
-                      />
-                    ) : (
-                      <ContinuationPage body={pageBody} signer={activeSigner} isLastPage={isLast} />
-                    )}
-                  </div>
-                );
-              })}
+            <div ref={previewZoomWrapperRef} style={{ zoom: previewScale, width: "100%", maxWidth: "720px" }}>
+              <div ref={previewRef} style={{ width: "100%", display: "flex", flexDirection: "column", gap: "12px" }}>
+                {pages.map((pageBody, i) => {
+                  const isFirst = i === 0;
+                  const isLast  = i === pages.length - 1;
+                  return (
+                    <div key={i} style={{ boxShadow: pageShadow, borderRadius: "3px", overflow: "hidden" }}>
+                      {isFirst ? (
+                        <LetterheadPage
+                          bg={isHRT ? HRT_BG : TRT_BG}
+                          body={pageBody}
+                          signer={activeSigner}
+                          headerEndPct={isHRT ? 22 : 14.5}
+                          footerStartPct={89.9}
+                          isLastPage={isLast}
+                        />
+                      ) : (
+                        <ContinuationPage body={pageBody} signer={activeSigner} isLastPage={isLast} />
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </div>
         </div>
