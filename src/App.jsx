@@ -1,28 +1,12 @@
 import { useState, useRef, useEffect } from "react";
 
-const HRT_BG = "/hrt_letterhead.png";
-const TRT_BG = "/trt_letterhead.png";
-const LOGO   = "/logo.png";
+const BASE = (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.BASE_URL) ? import.meta.env.BASE_URL : "/";
+const HRT_BG = `${BASE}hrt_letterhead.png`;
+const TRT_BG = `${BASE}trt_letterhead.png`;
+const LOGO   = `${BASE}logo.png`;
 
-// ---------------------------------------------------------------------------
-// Snippet templates
-// ---------------------------------------------------------------------------
-const today = new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
-
-const SNIPPETS = [
-  {
-    label: "Prior Authorization",
-    text: `Date: ${today}\n\nTo Whom It May Concern,\n\nWe are writing to request prior authorization for [PATIENT NAME], Date of Birth: [DOB], for the following treatment: [TREATMENT/MEDICATION].\n\nThe patient has been evaluated and it is our clinical determination that this treatment is medically necessary due to [CLINICAL REASON].\n\nPlease find attached supporting clinical documentation. We respectfully request expedited review given the medical urgency of this case.\n\nThank you for your prompt attention to this matter. Please do not hesitate to contact our office at support@fountain.net with any questions.\n\nSincerely,`,
-  },
-  {
-    label: "Medical Necessity",
-    text: `Date: ${today}\n\nTo Whom It May Concern,\n\nThis letter serves to document the medical necessity of [TREATMENT/MEDICATION] for our patient, [PATIENT NAME], Date of Birth: [DOB].\n\n[PATIENT NAME] has been under our care since [DATE] and presents with [DIAGNOSIS/CONDITION]. After thorough clinical evaluation, we have determined that [TREATMENT/MEDICATION] is medically necessary for the following reasons:\n\n1. [CLINICAL REASON 1]\n2. [CLINICAL REASON 2]\n3. [CLINICAL REASON 3]\n\nAlternative treatments including [ALTERNATIVES] have been considered and deemed insufficient due to [REASON].\n\nIt is our professional medical opinion that proceeding with this treatment is in the best interest of the patient\'s health and well-being.\n\nSincerely,`,
-  },
-  {
-    label: "Prescription Letter",
-    text: `Date: ${today}\n\nTo Whom It May Concern,\n\nThis letter confirms that [PATIENT NAME], Date of Birth: [DOB], is currently under the care of Fountain Health and has been prescribed the following:\n\nMedication: [MEDICATION NAME]\nDosage: [DOSAGE]\nFrequency: [FREQUENCY]\nDuration: [DURATION]\n\nThis prescription has been issued following a thorough clinical evaluation and is medically indicated for the treatment of [CONDITION].\n\nIf you have any questions regarding this prescription, please contact our office at support@fountain.net or (213) 237-1454.\n\nSincerely,`,
-  },
-];
+const DRAFT_DEBOUNCE_MS = 600;
+const LONG_LETTER_PAGE_WARN = 10;
 
 // ---------------------------------------------------------------------------
 // Pagination helpers
@@ -118,6 +102,13 @@ const ContinuationPage = ({ body, signer, isLastPage }) => (
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
+function getStoredDark() {
+  try {
+    const v = localStorage.getItem("fountain_dark");
+    return v === "true";
+  } catch (_) { return false; }
+}
+
 export default function App() {
   const [template, setTemplate]               = useState("HRT");
   const [body, setBody]                       = useState("");
@@ -130,14 +121,22 @@ export default function App() {
   const [newSignerName, setNewSignerName]       = useState("");
   const [newSignerTitle, setNewSignerTitle]     = useState("");
   const [showAddSigner, setShowAddSigner]       = useState(false);
+  const [addSignerError, setAddSignerError]     = useState("");
   const [tab, setTab]                           = useState("compose");
-  const [dark, setDark]                         = useState(false);
+  const [dark, setDark]                         = useState(getStoredDark);
   const [section, setSection]                   = useState("generator");
   const [contactForm, setContactForm]           = useState({ name: "", email: "", message: "" });
   const [contactSent, setContactSent]           = useState(false);
   const [savedDraft, setSavedDraft]             = useState(null);
-  const [copySuccess, setCopySuccess]           = useState(false);
+  const [copyStatus, setCopyStatus]            = useState(null); // "copied" | "failed" | null
+  const [pdfNote, setPdfNote]                  = useState(false);
   const previewRef = useRef();
+  const mainContentRef = useRef();
+
+  // ── Persist dark mode ─────────────────────────────────────────────────────
+  useEffect(() => {
+    try { localStorage.setItem("fountain_dark", dark ? "true" : "false"); } catch (_) {}
+  }, [dark]);
 
   // ── Auto-save / restore ──────────────────────────────────────────────────
   useEffect(() => {
@@ -148,13 +147,22 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (body || selectedSignerId) {
-      localStorage.setItem(
-        "fountain_draft",
-        JSON.stringify({ body, template, selectedSignerId, savedAt: new Date().toISOString() })
-      );
-    }
+    if (!body && selectedSignerId == null) return;
+    const id = setTimeout(() => {
+      try {
+        localStorage.setItem(
+          "fountain_draft",
+          JSON.stringify({ body, template, selectedSignerId, savedAt: new Date().toISOString() })
+        );
+      } catch (_) {}
+    }, DRAFT_DEBOUNCE_MS);
+    return () => clearTimeout(id);
   }, [body, template, selectedSignerId]);
+
+  // ── Focus main content when section changes ───────────────────────────────
+  useEffect(() => {
+    mainContentRef.current?.focus?.();
+  }, [section]);
 
   const restoreDraft = () => {
     if (!savedDraft) return;
@@ -172,6 +180,7 @@ export default function App() {
   const pages       = paginateText(body, charsP1);
   const overflowWarn = body.length > charsP1 * 0.9 && pages.length === 1;
   const isMultiPage  = pages.length > 1;
+  const longLetterWarn = pages.length > LONG_LETTER_PAGE_WARN;
   const activeSigner = signers.find((s) => s.id === selectedSignerId) || null;
 
   // ── Theme tokens ─────────────────────────────────────────────────────────
@@ -195,16 +204,29 @@ export default function App() {
 
   // ── Handlers ─────────────────────────────────────────────────────────────
   const addSigner = () => {
-    if (!newSignerName.trim()) return;
-    setSigners((p) => [...p, { id: Date.now(), name: newSignerName.trim(), title: newSignerTitle.trim() }]);
+    const name = newSignerName.trim();
+    const title = newSignerTitle.trim();
+    if (!name) { setAddSignerError("Name is required."); return; }
+    if (!title) { setAddSignerError("Title is required."); return; }
+    setAddSignerError("");
+    setSigners((p) => [...p, { id: Date.now(), name, title }]);
     setNewSignerName(""); setNewSignerTitle(""); setShowAddSigner(false);
   };
 
   const copyToClipboard = () => {
+    setCopyStatus(null);
     navigator.clipboard.writeText(body).then(() => {
-      setCopySuccess(true);
-      setTimeout(() => setCopySuccess(false), 2000);
+      setCopyStatus("copied");
+      setTimeout(() => setCopyStatus(null), 2000);
+    }).catch(() => {
+      setCopyStatus("failed");
+      setTimeout(() => setCopyStatus(null), 3000);
     });
+  };
+
+  const startFresh = () => {
+    setBody("");
+    setSelectedSignerId(null);
   };
 
   const handleExportPDF = () => {
@@ -218,6 +240,8 @@ export default function App() {
        </head><body>${content}<script>window.onload=function(){window.print();}<\/script></body></html>`
     );
     win.document.close();
+    setPdfNote(true);
+    setTimeout(() => setPdfNote(false), 6000);
   };
 
   const handleExportWord = () => {
@@ -227,10 +251,13 @@ export default function App() {
       [`<!DOCTYPE html><html><body>${content}</body></html>`],
       { type: "application/msword" }
     );
-    Object.assign(document.createElement("a"), {
-      href: URL.createObjectURL(blob),
-      download: `fountain-${template.toLowerCase()}-letter.doc`,
-    }).click();
+    const url = URL.createObjectURL(blob);
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `fountain-${template.toLowerCase()}-letter-${dateStr}.doc`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const handleContactSubmit = () => {
@@ -268,7 +295,7 @@ export default function App() {
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <div style={{ minHeight: "100vh", height: "100vh", background: T.bg, fontFamily: "'Helvetica Neue', Arial, sans-serif", display: "flex", flexDirection: "column", transition: "background 0.3s", overflow: "hidden" }}>
+    <div ref={mainContentRef} tabIndex={-1} style={{ minHeight: "100vh", height: "100vh", background: T.bg, fontFamily: "'Helvetica Neue', Arial, sans-serif", display: "flex", flexDirection: "column", transition: "background 0.3s", overflow: "hidden", outline: "none" }}>
 
       {/* ── Top bar ── */}
       <div style={{ background: T.topbar, borderBottom: `1px solid ${T.border}`, padding: "0 24px", display: "flex", alignItems: "center", justifyContent: "space-between", height: "56px", flexShrink: 0, boxShadow: dark ? "none" : "0 1px 8px rgba(13,43,78,0.06)", transition: "background 0.3s" }}>
@@ -290,7 +317,7 @@ export default function App() {
         </div>
 
         <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-          <button onClick={() => setDark((d) => !d)} title={dark ? "Light mode" : "Dark mode"} style={{ width: "36px", height: "36px", borderRadius: "8px", border: `1px solid ${T.border}`, background: "transparent", color: T.textMuted, fontSize: "16px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <button type="button" onClick={() => setDark((d) => !d)} title={dark ? "Light mode" : "Dark mode"} aria-label={dark ? "Switch to light mode" : "Switch to dark mode"} style={{ width: "36px", height: "36px", borderRadius: "8px", border: `1px solid ${T.border}`, background: "transparent", color: T.textMuted, fontSize: "16px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
             {dark ? "☀️" : "🌙"}
           </button>
           {section === "generator" && (
@@ -312,6 +339,15 @@ export default function App() {
             <button onClick={restoreDraft} style={{ padding: "4px 12px", borderRadius: "6px", border: "none", background: accent, color: "white", fontSize: "12px", cursor: "pointer", fontWeight: "600" }}>Restore</button>
             <button onClick={() => setSavedDraft(null)} style={{ padding: "4px 12px", borderRadius: "6px", border: `1px solid ${dark ? "#2a3a52" : "#93c5fd"}`, background: "transparent", color: dark ? "#93c5fd" : "#1d4ed8", fontSize: "12px", cursor: "pointer" }}>Dismiss</button>
           </div>
+        </div>
+      )}
+
+      {/* ── PDF export note ── */}
+      {pdfNote && section === "generator" && (
+        <div style={{ background: dark ? "#1e3a5f" : "#dbeafe", borderBottom: `1px solid ${dark ? "#2563eb" : "#93c5fd"}`, padding: "8px 24px", flexShrink: 0 }}>
+          <span style={{ fontSize: "12.5px", color: dark ? "#93c5fd" : "#1d4ed8" }}>
+            Use the print dialog in the new tab to save as PDF, then you can close that tab.
+          </span>
         </div>
       )}
 
@@ -355,27 +391,20 @@ export default function App() {
               {tab === "compose" && (
                 <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
 
-                  {/* Quick templates */}
-                  <div>
-                    <label style={labelStyle}>Quick Templates</label>
-                    <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
-                      {SNIPPETS.map((s) => (
-                        <button key={s.label} onClick={() => setBody(s.text)}
-                          onMouseEnter={(e) => (e.target.style.borderColor = accent)}
-                          onMouseLeave={(e) => (e.target.style.borderColor = T.inputBorder)}
-                          style={{ padding: "7px 12px", borderRadius: "7px", border: `1px solid ${T.inputBorder}`, background: T.input, color: T.text, fontSize: "12px", cursor: "pointer", textAlign: "left", fontWeight: "500", transition: "border-color 0.2s" }}
-                        >📄 {s.label}</button>
-                      ))}
-                    </div>
-                  </div>
-
                   {/* Body */}
                   <div>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "7px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "7px", flexWrap: "wrap", gap: "6px" }}>
                       <label style={{ ...labelStyle, marginBottom: 0 }}>Letter Body</label>
-                      <button onClick={copyToClipboard} style={{ padding: "3px 10px", borderRadius: "6px", border: `1px solid ${T.inputBorder}`, background: copySuccess ? "#d1fae5" : T.input, color: copySuccess ? "#065f46" : T.textMuted, fontSize: "11px", cursor: "pointer", fontWeight: "600", transition: "all 0.2s" }}>
-                        {copySuccess ? "✓ Copied!" : "⎘ Copy"}
-                      </button>
+                      <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                        {body.trim() && (
+                          <button type="button" onClick={startFresh} style={{ padding: "3px 10px", borderRadius: "6px", border: `1px solid ${T.inputBorder}`, background: T.input, color: T.textMuted, fontSize: "11px", cursor: "pointer", fontWeight: "600" }}>
+                            Start fresh
+                          </button>
+                        )}
+                        <button type="button" onClick={copyToClipboard} style={{ padding: "3px 10px", borderRadius: "6px", border: `1px solid ${T.inputBorder}`, background: copyStatus === "copied" ? "#d1fae5" : copyStatus === "failed" ? "#fef2f2" : T.input, color: copyStatus === "copied" ? "#065f46" : copyStatus === "failed" ? "#b91c1c" : T.textMuted, fontSize: "11px", cursor: "pointer", fontWeight: "600", transition: "all 0.2s" }}>
+                          {copyStatus === "copied" ? "✓ Copied!" : copyStatus === "failed" ? "Copy failed" : "⎘ Copy"}
+                        </button>
+                      </div>
                     </div>
                     <textarea
                       value={body}
@@ -385,10 +414,11 @@ export default function App() {
                       onBlur={(e)  => (e.target.style.borderColor = T.inputBorder)}
                       style={{ ...inputStyle, minHeight: "280px", resize: "vertical", lineHeight: "1.7", fontFamily: "Georgia, serif" }}
                     />
-                    <div style={{ marginTop: "5px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div style={{ marginTop: "5px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "4px" }}>
                       {overflowWarn && !isMultiPage && <span style={{ fontSize: "10.5px", color: "#f59e0b", fontWeight: "600" }}>⚠ Approaching page limit</span>}
-                      {isMultiPage  && <span style={{ fontSize: "10.5px", color: accent, fontWeight: "600" }}>📄 {pages.length} pages</span>}
-                      {!overflowWarn && !isMultiPage && <span />}
+                      {longLetterWarn && <span style={{ fontSize: "10.5px", color: "#b45309", fontWeight: "600" }}>Very long letter — consider splitting</span>}
+                      {isMultiPage  && !longLetterWarn && <span style={{ fontSize: "10.5px", color: accent, fontWeight: "600" }}>📄 {pages.length} pages</span>}
+                      {!overflowWarn && !isMultiPage && !longLetterWarn && <span />}
                       <span style={{ fontSize: "10px", color: T.textMuted }}>{body.length} chars</span>
                     </div>
                   </div>
@@ -415,16 +445,17 @@ export default function App() {
                 <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                     <span style={labelStyle}>{signers.length} Signer{signers.length !== 1 ? "s" : ""}</span>
-                    <button onClick={() => setShowAddSigner((p) => !p)} style={{ padding: "6px 12px", borderRadius: "7px", border: showAddSigner ? `1px solid ${T.border}` : "none", background: showAddSigner ? T.card : accentGrad, color: showAddSigner ? T.textMuted : "white", fontSize: "11.5px", cursor: "pointer", fontWeight: "600" }}>
+                    <button type="button" onClick={() => { setShowAddSigner((p) => !p); setAddSignerError(""); }} style={{ padding: "6px 12px", borderRadius: "7px", border: showAddSigner ? `1px solid ${T.border}` : "none", background: showAddSigner ? T.card : accentGrad, color: showAddSigner ? T.textMuted : "white", fontSize: "11.5px", cursor: "pointer", fontWeight: "600" }}>
                       {showAddSigner ? "✕ Cancel" : "+ Add Signer"}
                     </button>
                   </div>
 
                   {showAddSigner && (
                     <div style={{ background: T.card, border: `1px solid ${accent}40`, borderRadius: "10px", padding: "14px", display: "flex", flexDirection: "column", gap: "10px" }}>
-                      <input placeholder="Full name" value={newSignerName} onChange={(e) => setNewSignerName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addSigner()} onFocus={(e) => (e.target.style.borderColor = accent)} onBlur={(e) => (e.target.style.borderColor = T.inputBorder)} style={inputStyle} />
-                      <input placeholder="Title (e.g. NP, Medical Director)" value={newSignerTitle} onChange={(e) => setNewSignerTitle(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addSigner()} onFocus={(e) => (e.target.style.borderColor = accent)} onBlur={(e) => (e.target.style.borderColor = T.inputBorder)} style={inputStyle} />
-                      <button onClick={addSigner} style={{ padding: "9px", borderRadius: "7px", border: "none", background: accentGrad, color: "white", fontWeight: "700", fontSize: "12.5px", cursor: "pointer" }}>Add Signer</button>
+                      <input placeholder="Full name" value={newSignerName} onChange={(e) => setNewSignerName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addSigner()} onFocus={(e) => (e.target.style.borderColor = accent)} onBlur={(e) => (e.target.style.borderColor = T.inputBorder)} style={inputStyle} aria-invalid={!!addSignerError} />
+                      <input placeholder="Title (e.g. NP, Medical Director)" value={newSignerTitle} onChange={(e) => setNewSignerTitle(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addSigner()} onFocus={(e) => (e.target.style.borderColor = accent)} onBlur={(e) => (e.target.style.borderColor = T.inputBorder)} style={inputStyle} aria-invalid={!!addSignerError} />
+                      {addSignerError && <span style={{ fontSize: "11px", color: "#b91c1c", fontWeight: "600" }}>{addSignerError}</span>}
+                      <button type="button" onClick={addSigner} style={{ padding: "9px", borderRadius: "7px", border: "none", background: accentGrad, color: "white", fontWeight: "700", fontSize: "12.5px", cursor: "pointer" }}>Add Signer</button>
                     </div>
                   )}
 
@@ -436,14 +467,23 @@ export default function App() {
                   )}
 
                   {signers.map((s) => (
-                    <div key={s.id} onClick={() => setSelectedSignerId(selectedSignerId === s.id ? null : s.id)} style={{ background: selectedSignerId === s.id ? `${accent}12` : T.card, border: `1px solid ${selectedSignerId === s.id ? accent + "50" : T.border}`, borderRadius: "10px", padding: "11px 13px", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center", transition: "all 0.2s" }}>
+                    <div
+                      key={s.id}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => setSelectedSignerId(selectedSignerId === s.id ? null : s.id)}
+                      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setSelectedSignerId(selectedSignerId === s.id ? null : s.id); } }}
+                      aria-pressed={selectedSignerId === s.id}
+                      aria-label={`${s.name}, ${s.title || "No title"}. ${selectedSignerId === s.id ? "Selected" : "Click to select"}`}
+                      style={{ background: selectedSignerId === s.id ? `${accent}12` : T.card, border: `1px solid ${selectedSignerId === s.id ? accent + "50" : T.border}`, borderRadius: "10px", padding: "11px 13px", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center", transition: "all 0.2s" }}
+                    >
                       <div>
                         <div style={{ color: T.text, fontWeight: "600", fontSize: "13px" }}>{s.name}</div>
                         <div style={{ color: T.textMuted, fontSize: "11px", marginTop: "2px" }}>{s.title || "No title"}</div>
                       </div>
                       <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
                         {selectedSignerId === s.id && <span style={{ fontSize: "10px", color: accent, fontWeight: "700", background: `${accent}15`, padding: "3px 8px", borderRadius: "20px" }}>Selected</span>}
-                        <button onClick={(e) => { e.stopPropagation(); if (selectedSignerId === s.id) setSelectedSignerId(null); setSigners((p) => p.filter((x) => x.id !== s.id)); }} style={{ background: "transparent", border: "none", color: T.textMuted, cursor: "pointer", fontSize: "14px" }}>✕</button>
+                        <button type="button" aria-label={`Remove ${s.name}`} onClick={(e) => { e.stopPropagation(); if (selectedSignerId === s.id) setSelectedSignerId(null); setSigners((p) => p.filter((x) => x.id !== s.id)); }} style={{ background: "transparent", border: "none", color: T.textMuted, cursor: "pointer", fontSize: "14px" }}>✕</button>
                       </div>
                     </div>
                   ))}
@@ -493,7 +533,7 @@ export default function App() {
 
             {[
               { step: "1", icon: "📋", title: "Choose a Letterhead",        desc: "Select either HRT or TRT letterhead using the toggle in the left panel. The preview updates instantly." },
-              { step: "2", icon: "✍️", title: "Use a Quick Template or Write from Scratch", desc: "Click one of the Quick Templates to pre-fill common boilerplate, then customize the bracketed fields. Or write your own letter in the body area." },
+              { step: "2", icon: "✍️", title: "Write Your Letter", desc: "Type or paste your letter in the Letter Body area. Replace any [BRACKETED] placeholders before exporting." },
               { step: "3", icon: "👤", title: "Select a Signer",             desc: "Choose a signer from the dropdown. Their name and title will appear at the bottom of the letter. Manage signers in the Signers tab." },
               { step: "4", icon: "📄", title: "Review the Live Preview",     desc: "The preview updates as you type. Long letters automatically flow onto a second page. A warning appears when you're approaching the page limit." },
               { step: "5", icon: "⬇️", title: "Export Your Document",        desc: "Click PDF to open a print dialog and save as PDF. Click Word to download a .doc file. Both are ready to upload directly to DocuSign." },
