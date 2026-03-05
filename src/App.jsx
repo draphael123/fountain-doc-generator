@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import mammoth from "mammoth";
-import { PDFDocument } from "pdf-lib";
+import { PDFDocument, rgb } from "pdf-lib";
 
 const BASE = (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.BASE_URL) ? import.meta.env.BASE_URL : "/";
 const HRT_BG = `${BASE}hrt_letterhead.png`;
@@ -491,11 +491,55 @@ export default function App() {
         imgWidth = height * aspectRatio;
       }
 
-      // Calculate footer height for content shifting
+      // Calculate header and footer heights
       const footerHeight = imgHeight * footerHeightPct;
+      const headerHeight = imgHeight * headerHeightPct;
 
+      // CLIPPING APPROACH: Draw content first, then overlay header/footer on top
+
+      // Step 1: Draw white background
+      newPage.drawRectangle({
+        x: 0,
+        y: 0,
+        width: width,
+        height: height,
+        color: rgb(1, 1, 1),
+      });
+
+      // Step 2: Draw the uploaded content at full size
+      const [embeddedPage] = await pdfDoc.embedPages([srcPage]);
+      newPage.drawPage(embeddedPage, {
+        x: 0,
+        y: 0,
+        width: width,
+        height: height,
+      });
+
+      // Step 3: Draw white rectangle to cover header area (clips content)
       if (i === 0) {
-        // First page: draw full letterhead as background
+        newPage.drawRectangle({
+          x: 0,
+          y: height - headerHeight,
+          width: width,
+          height: headerHeight,
+          color: rgb(1, 1, 1),
+        });
+      }
+
+      // Step 4: Draw white rectangle to cover footer area (clips content)
+      if (i === 0 || includeFooterOnAllPages) {
+        newPage.drawRectangle({
+          x: 0,
+          y: 0,
+          width: width,
+          height: footerHeight,
+          color: rgb(1, 1, 1),
+        });
+      }
+
+      // Step 5: Draw letterhead header/footer on top
+      if (i === 0) {
+        // First page: draw full letterhead (header + footer will show, middle is already covered by content)
         newPage.drawImage(letterheadImage, {
           x: 0,
           y: height - imgHeight,
@@ -504,62 +548,11 @@ export default function App() {
         });
       } else if (includeFooterOnAllPages) {
         // Continuation pages: draw only footer portion at bottom
-        // The image is drawn with its top at a negative Y, so only bottom portion is visible
         newPage.drawImage(letterheadImage, {
           x: 0,
           y: -imgHeight + footerHeight,
           width: imgWidth,
           height: imgHeight,
-        });
-      }
-
-      // Copy original page content
-      const [embeddedPage] = await pdfDoc.embedPages([srcPage]);
-
-      if (i === 0) {
-        // First page: scale content to fit between header and footer
-        const headerHeight = imgHeight * headerHeightPct;
-        const availableHeight = height - headerHeight - footerHeight;
-
-        // Scale content proportionally to fit in available space
-        const scale = availableHeight / height;
-        const scaledWidth = width * scale;
-        const scaledHeight = height * scale;
-
-        // Center horizontally and position above footer
-        const xOffset = (width - scaledWidth) / 2;
-
-        newPage.drawPage(embeddedPage, {
-          x: xOffset,
-          y: footerHeight,
-          width: scaledWidth,
-          height: scaledHeight,
-        });
-      } else if (includeFooterOnAllPages) {
-        // Continuation pages with footer: scale content to fit above the footer
-        const availableHeight = height - footerHeight;
-
-        // Scale content proportionally to fit in available space
-        const scale = availableHeight / height;
-        const scaledWidth = width * scale;
-        const scaledHeight = height * scale;
-
-        // Center horizontally and position above footer
-        const xOffset = (width - scaledWidth) / 2;
-
-        newPage.drawPage(embeddedPage, {
-          x: xOffset,
-          y: footerHeight,
-          width: scaledWidth,
-          height: scaledHeight,
-        });
-      } else {
-        // Continuation pages without footer: draw at original size
-        newPage.drawPage(embeddedPage, {
-          x: 0,
-          y: 0,
-          width: width,
-          height: height,
         });
       }
     }
