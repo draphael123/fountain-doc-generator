@@ -514,16 +514,36 @@ export default function App() {
       // Copy original page content
       const [embeddedPage] = await pdfDoc.embedPages([srcPage]);
 
-      // For continuation pages with footer, shift content up to make room for footer
-      const shouldShiftUp = i > 0 && includeFooterOnAllPages;
-      const contentYOffset = shouldShiftUp ? footerHeight : 0;
+      // For continuation pages with footer, scale content to fit above the footer
+      const shouldScaleForFooter = i > 0 && includeFooterOnAllPages;
 
-      newPage.drawPage(embeddedPage, {
-        x: 0,
-        y: contentYOffset,
-        width: width,
-        height: height,
-      });
+      if (shouldScaleForFooter) {
+        // Calculate available space above footer
+        const availableHeight = height - footerHeight;
+
+        // Scale content proportionally to fit in available space
+        const scale = availableHeight / height;
+        const scaledWidth = width * scale;
+        const scaledHeight = height * scale;
+
+        // Center horizontally and position above footer
+        const xOffset = (width - scaledWidth) / 2;
+
+        newPage.drawPage(embeddedPage, {
+          x: xOffset,
+          y: footerHeight,
+          width: scaledWidth,
+          height: scaledHeight,
+        });
+      } else {
+        // First page or no footer: draw at original size
+        newPage.drawPage(embeddedPage, {
+          x: 0,
+          y: 0,
+          width: width,
+          height: height,
+        });
+      }
     }
 
     return { pdfBytes: await pdfDoc.save(), pageCount };
