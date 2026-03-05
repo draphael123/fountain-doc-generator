@@ -489,6 +489,9 @@ export default function App() {
         imgWidth = height * aspectRatio;
       }
 
+      // Calculate footer height for content shifting
+      const footerHeight = imgHeight * footerHeightPct;
+
       if (i === 0) {
         // First page: draw full letterhead as background
         newPage.drawImage(letterheadImage, {
@@ -499,10 +502,6 @@ export default function App() {
         });
       } else if (includeFooterOnAllPages) {
         // Continuation pages: draw only footer portion at bottom
-        // Calculate the footer height in page coordinates
-        const footerHeight = imgHeight * footerHeightPct;
-
-        // Draw the letterhead image positioned so only footer shows at bottom
         // The image is drawn with its top at a negative Y, so only bottom portion is visible
         newPage.drawImage(letterheadImage, {
           x: 0,
@@ -512,11 +511,16 @@ export default function App() {
         });
       }
 
-      // Copy original page content on top
+      // Copy original page content
       const [embeddedPage] = await pdfDoc.embedPages([srcPage]);
+
+      // For continuation pages with footer, shift content up to make room for footer
+      const shouldShiftUp = i > 0 && includeFooterOnAllPages;
+      const contentYOffset = shouldShiftUp ? footerHeight : 0;
+
       newPage.drawPage(embeddedPage, {
         x: 0,
-        y: 0,
+        y: contentYOffset,
         width: width,
         height: height,
       });
