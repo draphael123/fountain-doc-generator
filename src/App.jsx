@@ -465,10 +465,10 @@ export default function App() {
     const letterheadBytes = await letterheadResponse.arrayBuffer();
     const letterheadImage = await pdfDoc.embedPng(new Uint8Array(letterheadBytes));
 
-    // Footer starts at ~89.9% of the letterhead (bottom ~10.1% is footer)
-    const footerHeightPct = 0.101;
-    // Header ends at different positions for different templates
-    const headerHeightPct = templateType === "HRT" ? 0.22 : 0.145;
+    // Footer area including the pink bar above contact info (~13% from bottom)
+    const footerHeightPct = 0.13;
+    // Header ends at different positions for different templates (logo + pink bar)
+    const headerHeightPct = templateType === "HRT" ? 0.16 : 0.12;
 
     const srcPages = srcDoc.getPages();
     const pageCount = srcPages.length;
