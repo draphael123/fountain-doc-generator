@@ -467,6 +467,8 @@ export default function App() {
 
     // Footer starts at ~89.9% of the letterhead (bottom ~10.1% is footer)
     const footerHeightPct = 0.101;
+    // Header ends at different positions for different templates
+    const headerHeightPct = templateType === "HRT" ? 0.22 : 0.145;
 
     const srcPages = srcDoc.getPages();
     const pageCount = srcPages.length;
@@ -514,11 +516,27 @@ export default function App() {
       // Copy original page content
       const [embeddedPage] = await pdfDoc.embedPages([srcPage]);
 
-      // For continuation pages with footer, scale content to fit above the footer
-      const shouldScaleForFooter = i > 0 && includeFooterOnAllPages;
+      if (i === 0) {
+        // First page: scale content to fit between header and footer
+        const headerHeight = imgHeight * headerHeightPct;
+        const availableHeight = height - headerHeight - footerHeight;
 
-      if (shouldScaleForFooter) {
-        // Calculate available space above footer
+        // Scale content proportionally to fit in available space
+        const scale = availableHeight / height;
+        const scaledWidth = width * scale;
+        const scaledHeight = height * scale;
+
+        // Center horizontally and position above footer
+        const xOffset = (width - scaledWidth) / 2;
+
+        newPage.drawPage(embeddedPage, {
+          x: xOffset,
+          y: footerHeight,
+          width: scaledWidth,
+          height: scaledHeight,
+        });
+      } else if (includeFooterOnAllPages) {
+        // Continuation pages with footer: scale content to fit above the footer
         const availableHeight = height - footerHeight;
 
         // Scale content proportionally to fit in available space
@@ -536,7 +554,7 @@ export default function App() {
           height: scaledHeight,
         });
       } else {
-        // First page or no footer: draw at original size
+        // Continuation pages without footer: draw at original size
         newPage.drawPage(embeddedPage, {
           x: 0,
           y: 0,
