@@ -11,6 +11,8 @@ const LOGO   = `${BASE}logo.png`;
 
 const DRAFT_DEBOUNCE_MS = 600;
 const LONG_LETTER_PAGE_WARN = 10;
+const MAX_FILE_SIZE_MB = 10;
+const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Pagination helpers
@@ -183,6 +185,9 @@ export default function App() {
   const [uploadedPdfBytes, setUploadedPdfBytes] = useState(null);
   const [uploadError, setUploadError] = useState(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [pdfPageCount, setPdfPageCount] = useState(0);
+  const [addFooterToAllPages, setAddFooterToAllPages] = useState(true);
+  const [isDragging, setIsDragging] = useState(false);
 
   // ── Persist dark mode ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -220,20 +225,25 @@ export default function App() {
     mainContentRef.current?.focus?.();
   }, [section]);
 
-  // ── Re-process PDF when template changes ─────────────────────────────────
+  // ── Re-process PDF when template or footer option changes ─────────────────
   const prevTemplateRef = useRef(template);
+  const prevFooterOptionRef = useRef(addFooterToAllPages);
   useEffect(() => {
-    // Only reprocess if template actually changed (not on initial upload)
-    if (uploadMode === "pdf" && uploadedFile && prevTemplateRef.current !== template) {
+    // Only reprocess if template or footer option changed (not on initial upload)
+    const templateChanged = prevTemplateRef.current !== template;
+    const footerOptionChanged = prevFooterOptionRef.current !== addFooterToAllPages;
+
+    if (uploadMode === "pdf" && uploadedFile && (templateChanged || footerOptionChanged)) {
       const reprocessPdf = async () => {
         setIsProcessing(true);
         try {
           const arrayBuffer = await uploadedFile.arrayBuffer();
-          const modifiedPdfBytes = await processPdfWithLetterhead(arrayBuffer, template);
-          setUploadedPdfBytes(modifiedPdfBytes);
+          const { pdfBytes, pageCount } = await processPdfWithLetterhead(arrayBuffer, template, addFooterToAllPages);
+          setUploadedPdfBytes(pdfBytes);
+          setPdfPageCount(pageCount);
         } catch (err) {
           console.error("Re-process error:", err);
-          setUploadError("Failed to re-process PDF with new template");
+          setUploadError("Failed to re-process PDF with new settings");
         } finally {
           setIsProcessing(false);
         }
@@ -241,7 +251,8 @@ export default function App() {
       reprocessPdf();
     }
     prevTemplateRef.current = template;
-  }, [template, uploadMode, uploadedFile]);
+    prevFooterOptionRef.current = addFooterToAllPages;
+  }, [template, addFooterToAllPages, uploadMode, uploadedFile]);
 
   const restoreDraft = () => {
     if (!savedDraft) return;
@@ -444,8 +455,8 @@ export default function App() {
     setUploadMode("docx");
   };
 
-  const processPdfWithLetterhead = async (arrayBuffer, templateType) => {
-    const srcDoc = await PDFDocument.load(arrayBuffer);
+  const processPdfWithLetterhead = async (arrayBuffer, templateType, includeFooterOnAllPages = true) => {
+    const srcDoc = await PDFDocument.load(arrayBuffer, { ignoreEncryption: false });
     const pdfDoc = await PDFDocument.create();
 
     // Load letterhead image
@@ -454,7 +465,11 @@ export default function App() {
     const letterheadBytes = await letterheadResponse.arrayBuffer();
     const letterheadImage = await pdfDoc.embedPng(new Uint8Array(letterheadBytes));
 
+    // Footer starts at ~89.9% of the letterhead (bottom ~10.1% is footer)
+    const footerHeightPct = 0.101;
+
     const srcPages = srcDoc.getPages();
+    const pageCount = srcPages.length;
 
     for (let i = 0; i < srcPages.length; i++) {
       const srcPage = srcPages[i];
@@ -463,24 +478,35 @@ export default function App() {
       // Create new page
       const newPage = pdfDoc.addPage([width, height]);
 
+      // Calculate letterhead dimensions scaled to page width
+      const aspectRatio = letterheadImage.width / letterheadImage.height;
+      let imgWidth = width;
+      let imgHeight = width / aspectRatio;
+
+      // If letterhead is taller than page, scale to fit height instead
+      if (imgHeight > height) {
+        imgHeight = height;
+        imgWidth = height * aspectRatio;
+      }
+
       if (i === 0) {
-        // Draw letterhead as background on first page
-        const aspectRatio = letterheadImage.width / letterheadImage.height;
-        const pageAspectRatio = width / height;
-
-        // Scale letterhead to fit page width while maintaining aspect ratio
-        let imgWidth = width;
-        let imgHeight = width / aspectRatio;
-
-        // If letterhead is taller than page, scale to fit height instead
-        if (imgHeight > height) {
-          imgHeight = height;
-          imgWidth = height * aspectRatio;
-        }
-
+        // First page: draw full letterhead as background
         newPage.drawImage(letterheadImage, {
           x: 0,
           y: height - imgHeight,
+          width: imgWidth,
+          height: imgHeight,
+        });
+      } else if (includeFooterOnAllPages) {
+        // Continuation pages: draw only footer portion at bottom
+        // Calculate the footer height in page coordinates
+        const footerHeight = imgHeight * footerHeightPct;
+
+        // Draw the letterhead image positioned so only footer shows at bottom
+        // The image is drawn with its top at a negative Y, so only bottom portion is visible
+        newPage.drawImage(letterheadImage, {
+          x: 0,
+          y: -imgHeight + footerHeight,
           width: imgWidth,
           height: imgHeight,
         });
@@ -496,15 +522,41 @@ export default function App() {
       });
     }
 
-    return await pdfDoc.save();
+    return { pdfBytes: await pdfDoc.save(), pageCount };
   };
 
-  const handlePdfUpload = async (file) => {
+  const handlePdfUpload = async (file, footerOption = true) => {
     const arrayBuffer = await file.arrayBuffer();
-    const modifiedPdfBytes = await processPdfWithLetterhead(arrayBuffer, template);
-    setUploadedPdfBytes(modifiedPdfBytes);
+    const { pdfBytes, pageCount } = await processPdfWithLetterhead(arrayBuffer, template, footerOption);
+    setUploadedPdfBytes(pdfBytes);
+    setPdfPageCount(pageCount);
     setUploadedFile(file);
     setUploadMode("pdf");
+  };
+
+  const processUploadedFile = async (file) => {
+    // Check file size
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      throw new Error(`File too large. Maximum size is ${MAX_FILE_SIZE_MB}MB.`);
+    }
+
+    const extension = file.name.split(".").pop().toLowerCase();
+
+    if (extension === "docx") {
+      await handleDocxUpload(file);
+    } else if (extension === "pdf") {
+      try {
+        await handlePdfUpload(file, addFooterToAllPages);
+      } catch (err) {
+        // Check for password-protected PDF
+        if (err.message?.includes("encrypted") || err.message?.includes("password")) {
+          throw new Error("This PDF is password-protected. Please remove the password and try again.");
+        }
+        throw err;
+      }
+    } else {
+      throw new Error("Unsupported file type. Please upload .docx or .pdf");
+    }
   };
 
   const handleFileUpload = async (event) => {
@@ -514,16 +566,8 @@ export default function App() {
     setIsProcessing(true);
     setUploadError(null);
 
-    const extension = file.name.split(".").pop().toLowerCase();
-
     try {
-      if (extension === "docx") {
-        await handleDocxUpload(file);
-      } else if (extension === "pdf") {
-        await handlePdfUpload(file);
-      } else {
-        throw new Error("Unsupported file type. Please upload .docx or .pdf");
-      }
+      await processUploadedFile(file);
     } catch (err) {
       console.error("Upload error:", err);
       setUploadError(err.message || "Failed to process file");
@@ -536,11 +580,46 @@ export default function App() {
     }
   };
 
+  // Drag and drop handlers
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+  };
+
+  const handleDrop = async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+
+    const file = e.dataTransfer.files?.[0];
+    if (!file) return;
+
+    setIsProcessing(true);
+    setUploadError(null);
+
+    try {
+      await processUploadedFile(file);
+    } catch (err) {
+      console.error("Upload error:", err);
+      setUploadError(err.message || "Failed to process file");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   const clearUpload = () => {
     setUploadedFile(null);
     setUploadMode(null);
     setUploadedPdfBytes(null);
     setUploadError(null);
+    setPdfPageCount(0);
     if (uploadMode === "docx") {
       setBody("");
     }
@@ -686,21 +765,31 @@ export default function App() {
                       id="file-upload"
                       disabled={isProcessing}
                     />
-                    <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                    <div
+                      onDragOver={handleDragOver}
+                      onDragLeave={handleDragLeave}
+                      onDrop={handleDrop}
+                      style={{ display: "flex", gap: "8px", alignItems: "center" }}
+                    >
                       <label
                         htmlFor="file-upload"
                         style={{
                           flex: 1,
-                          padding: "10px 14px",
+                          padding: uploadedFile ? "10px 14px" : "20px 14px",
                           borderRadius: "8px",
-                          border: `1px dashed ${uploadedFile ? accent : T.inputBorder}`,
-                          background: uploadedFile ? (dark ? "rgba(13,110,253,0.1)" : "#e8f4ff") : T.input,
-                          color: uploadedFile ? accent : T.textMuted,
+                          border: `2px dashed ${isDragging ? accent : uploadedFile ? accent : T.inputBorder}`,
+                          background: isDragging
+                            ? (dark ? "rgba(13,110,253,0.15)" : "#dbeafe")
+                            : uploadedFile
+                              ? (dark ? "rgba(13,110,253,0.1)" : "#e8f4ff")
+                              : T.input,
+                          color: isDragging ? accent : uploadedFile ? accent : T.textMuted,
                           fontSize: "12px",
                           cursor: isProcessing ? "wait" : "pointer",
                           textAlign: "center",
                           transition: "all 0.2s",
                           display: "flex",
+                          flexDirection: "column",
                           alignItems: "center",
                           justifyContent: "center",
                           gap: "6px",
@@ -709,9 +798,21 @@ export default function App() {
                         {isProcessing ? (
                           <>Processing...</>
                         ) : uploadedFile ? (
-                          <>📄 {uploadedFile.name}</>
+                          <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                            📄 {uploadedFile.name}
+                            {uploadMode === "pdf" && pdfPageCount > 1 && (
+                              <span style={{ background: accent, color: "white", padding: "2px 6px", borderRadius: "10px", fontSize: "10px", fontWeight: "600" }}>
+                                {pdfPageCount} pages
+                              </span>
+                            )}
+                          </span>
+                        ) : isDragging ? (
+                          <>Drop file here</>
                         ) : (
-                          <>📁 Choose .docx or .pdf</>
+                          <>
+                            <span>📁 Drop file here or click to browse</span>
+                            <span style={{ fontSize: "10px", opacity: 0.7 }}>.docx or .pdf (max {MAX_FILE_SIZE_MB}MB)</span>
+                          </>
                         )}
                       </label>
                       {uploadedFile && (
@@ -744,6 +845,33 @@ export default function App() {
                       </div>
                     )}
                   </div>
+
+                  {/* Multi-page PDF options */}
+                  {uploadMode === "pdf" && pdfPageCount > 1 && (
+                    <div style={{
+                      background: dark ? "rgba(13,110,253,0.08)" : "#f0f7ff",
+                      border: `1px solid ${dark ? "rgba(13,110,253,0.2)" : "#c7ddf7"}`,
+                      borderRadius: "8px",
+                      padding: "12px",
+                    }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px" }}>
+                        <span style={{ fontSize: "12px", fontWeight: "600", color: T.text }}>
+                          Multi-page Document ({pdfPageCount} pages)
+                        </span>
+                      </div>
+                      <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer" }}>
+                        <input
+                          type="checkbox"
+                          checked={addFooterToAllPages}
+                          onChange={(e) => setAddFooterToAllPages(e.target.checked)}
+                          style={{ accentColor: accent, width: "16px", height: "16px" }}
+                        />
+                        <span style={{ fontSize: "11px", color: T.textMuted }}>
+                          Add footer to all pages (letterhead footer with proper spacing)
+                        </span>
+                      </label>
+                    </div>
+                  )}
 
                   {/* Separator when in PDF mode */}
                   {uploadMode === "pdf" && (
@@ -932,11 +1060,12 @@ export default function App() {
 
             {[
               { step: "1", icon: "📋", title: "Choose a Letterhead",        desc: "Select either HRT or TRT letterhead using the toggle in the left panel. The preview updates instantly." },
-              { step: "2", icon: "✍️", title: "Write Your Letter", desc: "Type or paste your letter in the Letter Body area. Replace any [BRACKETED] placeholders before exporting." },
-              { step: "3", icon: "👤", title: "Select a Signer",             desc: "Choose a signer from the dropdown. Their name and title will appear at the bottom of the letter. Manage signers in the Signers tab." },
-              { step: "4", icon: "📄", title: "Review the Live Preview",     desc: "The preview updates as you type. Long letters automatically flow onto a second page. A warning appears when you're approaching the page limit." },
-              { step: "5", icon: "⬇️", title: "Export Your Document",        desc: "Click PDF to open a print dialog and save as PDF. Click Word to download a .doc file. Both are ready to upload directly to DocuSign." },
-              { step: "6", icon: "💾", title: "Auto-Save",                   desc: "Your draft is automatically saved as you type. If you close the tab, a restore banner will appear when you return." },
+              { step: "2", icon: "📤", title: "Upload or Write",            desc: "Drag & drop a .docx or .pdf file, or type your letter manually. Uploaded PDFs get the letterhead applied automatically. For multi-page PDFs, toggle the footer option to add letterhead footer to all pages." },
+              { step: "3", icon: "✍️", title: "Edit Your Letter",           desc: "For Word uploads, the text appears in the Letter Body area where you can edit it. Replace any [BRACKETED] placeholders before exporting." },
+              { step: "4", icon: "👤", title: "Select a Signer",             desc: "Choose a signer from the dropdown. Their name and title will appear at the bottom of the letter. Manage signers in the Signers tab." },
+              { step: "5", icon: "📄", title: "Review the Live Preview",     desc: "The preview updates as you type. Uploaded PDFs show in an embedded viewer. Long letters automatically flow onto multiple pages." },
+              { step: "6", icon: "⬇️", title: "Export Your Document",        desc: "Click PDF to download with letterhead applied. Click Word for a .doc file. Both are ready to upload directly to DocuSign." },
+              { step: "7", icon: "💾", title: "Auto-Save",                   desc: "Your draft is automatically saved as you type. If you close the tab, a restore banner will appear when you return." },
             ].map(({ step, icon, title, desc }) => (
               <div key={step} style={{ display: "flex", gap: "20px", marginBottom: "20px", padding: "20px 24px", background: T.panel, borderRadius: "12px", border: `1px solid ${T.border}`, transition: "background 0.3s" }}>
                 <div style={{ width: "42px", height: "42px", borderRadius: "10px", background: accentGrad, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "20px", flexShrink: 0 }}>{icon}</div>
@@ -951,6 +1080,8 @@ export default function App() {
             <div style={{ background: dark ? "#1a2332" : "#dbeafe", borderRadius: "12px", padding: "20px 24px", border: `1px solid ${dark ? "#2a3a52" : "#93c5fd"}` }}>
               <div style={{ fontSize: "14px", fontWeight: "700", color: dark ? "#93c5fd" : "#1d4ed8", marginBottom: "8px" }}>💡 Pro Tips</div>
               <ul style={{ color: dark ? "#6ea8fe" : "#1e40af", fontSize: "13px", lineHeight: "1.9", paddingLeft: "18px", margin: 0 }}>
+                <li>Drag & drop files directly onto the upload area for quick uploads.</li>
+                <li>For multi-page PDFs, enable "Add footer to all pages" to include letterhead footer on every page.</li>
                 <li>Use the ⎘ Copy button to paste letter text directly into Intercom.</li>
                 <li>Replace all bracketed fields like [PATIENT NAME] before exporting.</li>
                 <li>Long letters auto-paginate — scroll the preview to see all pages.</li>
