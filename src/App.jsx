@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect } from "react";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
+import mammoth from "mammoth";
+import { PDFDocument } from "pdf-lib";
 
 const BASE = (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.BASE_URL) ? import.meta.env.BASE_URL : "/";
 const HRT_BG = `${BASE}hrt_letterhead.png`;
@@ -102,6 +104,39 @@ const ContinuationPage = ({ body, signer, isLastPage }) => (
 );
 
 // ---------------------------------------------------------------------------
+// PDF Preview (for uploaded PDFs with letterhead applied)
+// ---------------------------------------------------------------------------
+const PdfPreview = ({ pdfBytes }) => {
+  const [objectUrl, setObjectUrl] = useState(null);
+
+  useEffect(() => {
+    if (pdfBytes) {
+      const blob = new Blob([pdfBytes], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+      setObjectUrl(url);
+      return () => URL.revokeObjectURL(url);
+    }
+  }, [pdfBytes]);
+
+  if (!objectUrl) return null;
+
+  return (
+    <iframe
+      src={objectUrl}
+      style={{
+        width: "100%",
+        height: "100%",
+        minHeight: "600px",
+        border: "none",
+        borderRadius: "8px",
+        background: "white",
+      }}
+      title="PDF Preview"
+    />
+  );
+};
+
+// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 function getStoredDark() {
@@ -140,6 +175,14 @@ export default function App() {
   const previewScrollRef = useRef();
   const previewZoomWrapperRef = useRef();
   const mainContentRef = useRef();
+  const fileInputRef = useRef();
+
+  // Upload state
+  const [uploadedFile, setUploadedFile] = useState(null);
+  const [uploadMode, setUploadMode] = useState(null); // 'docx' | 'pdf' | null
+  const [uploadedPdfBytes, setUploadedPdfBytes] = useState(null);
+  const [uploadError, setUploadError] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
 
   // ── Persist dark mode ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -176,6 +219,29 @@ export default function App() {
   useEffect(() => {
     mainContentRef.current?.focus?.();
   }, [section]);
+
+  // ── Re-process PDF when template changes ─────────────────────────────────
+  const prevTemplateRef = useRef(template);
+  useEffect(() => {
+    // Only reprocess if template actually changed (not on initial upload)
+    if (uploadMode === "pdf" && uploadedFile && prevTemplateRef.current !== template) {
+      const reprocessPdf = async () => {
+        setIsProcessing(true);
+        try {
+          const arrayBuffer = await uploadedFile.arrayBuffer();
+          const modifiedPdfBytes = await processPdfWithLetterhead(arrayBuffer, template);
+          setUploadedPdfBytes(modifiedPdfBytes);
+        } catch (err) {
+          console.error("Re-process error:", err);
+          setUploadError("Failed to re-process PDF with new template");
+        } finally {
+          setIsProcessing(false);
+        }
+      };
+      reprocessPdf();
+    }
+    prevTemplateRef.current = template;
+  }, [template, uploadMode, uploadedFile]);
 
   const restoreDraft = () => {
     if (!savedDraft) return;
@@ -249,6 +315,20 @@ export default function App() {
   };
 
   const handleExportPDF = async () => {
+    // Handle uploaded PDF export
+    if (uploadMode === "pdf" && uploadedPdfBytes) {
+      const blob = new Blob([uploadedPdfBytes], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `fountain-${template.toLowerCase()}-letter-${dateStr}.pdf`;
+      a.click();
+      URL.revokeObjectURL(url);
+      return;
+    }
+
+    // Handle composed document export
     const container = previewRef.current;
     if (!container || !container.children.length) return;
     setPdfNote(true);
@@ -353,6 +433,120 @@ export default function App() {
     window.open(`mailto:daniel@fountain.net?subject=${subj}&body=${bod}`);
     setContactSent(true);
     setContactForm({ name: "", email: "", message: "" });
+  };
+
+  // ── Document upload handlers ───────────────────────────────────────────────
+  const handleDocxUpload = async (file) => {
+    const arrayBuffer = await file.arrayBuffer();
+    const result = await mammoth.extractRawText({ arrayBuffer });
+    setBody(result.value);
+    setUploadedFile(file);
+    setUploadMode("docx");
+  };
+
+  const processPdfWithLetterhead = async (arrayBuffer, templateType) => {
+    const srcDoc = await PDFDocument.load(arrayBuffer);
+    const pdfDoc = await PDFDocument.create();
+
+    // Load letterhead image
+    const letterheadUrl = templateType === "HRT" ? HRT_BG : TRT_BG;
+    const letterheadResponse = await fetch(letterheadUrl);
+    const letterheadBytes = await letterheadResponse.arrayBuffer();
+    const letterheadImage = await pdfDoc.embedPng(new Uint8Array(letterheadBytes));
+
+    const srcPages = srcDoc.getPages();
+
+    for (let i = 0; i < srcPages.length; i++) {
+      const srcPage = srcPages[i];
+      const { width, height } = srcPage.getSize();
+
+      // Create new page
+      const newPage = pdfDoc.addPage([width, height]);
+
+      if (i === 0) {
+        // Draw letterhead as background on first page
+        const aspectRatio = letterheadImage.width / letterheadImage.height;
+        const pageAspectRatio = width / height;
+
+        // Scale letterhead to fit page width while maintaining aspect ratio
+        let imgWidth = width;
+        let imgHeight = width / aspectRatio;
+
+        // If letterhead is taller than page, scale to fit height instead
+        if (imgHeight > height) {
+          imgHeight = height;
+          imgWidth = height * aspectRatio;
+        }
+
+        newPage.drawImage(letterheadImage, {
+          x: 0,
+          y: height - imgHeight,
+          width: imgWidth,
+          height: imgHeight,
+        });
+      }
+
+      // Copy original page content on top
+      const [embeddedPage] = await pdfDoc.embedPages([srcPage]);
+      newPage.drawPage(embeddedPage, {
+        x: 0,
+        y: 0,
+        width: width,
+        height: height,
+      });
+    }
+
+    return await pdfDoc.save();
+  };
+
+  const handlePdfUpload = async (file) => {
+    const arrayBuffer = await file.arrayBuffer();
+    const modifiedPdfBytes = await processPdfWithLetterhead(arrayBuffer, template);
+    setUploadedPdfBytes(modifiedPdfBytes);
+    setUploadedFile(file);
+    setUploadMode("pdf");
+  };
+
+  const handleFileUpload = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setIsProcessing(true);
+    setUploadError(null);
+
+    const extension = file.name.split(".").pop().toLowerCase();
+
+    try {
+      if (extension === "docx") {
+        await handleDocxUpload(file);
+      } else if (extension === "pdf") {
+        await handlePdfUpload(file);
+      } else {
+        throw new Error("Unsupported file type. Please upload .docx or .pdf");
+      }
+    } catch (err) {
+      console.error("Upload error:", err);
+      setUploadError(err.message || "Failed to process file");
+    } finally {
+      setIsProcessing(false);
+      // Reset file input
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    }
+  };
+
+  const clearUpload = () => {
+    setUploadedFile(null);
+    setUploadMode(null);
+    setUploadedPdfBytes(null);
+    setUploadError(null);
+    if (uploadMode === "docx") {
+      setBody("");
+    }
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
   };
 
   // ── Shared style helpers ─────────────────────────────────────────────────
@@ -480,6 +674,86 @@ export default function App() {
               {tab === "compose" && (
                 <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
 
+                  {/* Upload Document */}
+                  <div>
+                    <label style={labelStyle}>Upload Document</label>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept=".docx,.pdf"
+                      onChange={handleFileUpload}
+                      style={{ display: "none" }}
+                      id="file-upload"
+                      disabled={isProcessing}
+                    />
+                    <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                      <label
+                        htmlFor="file-upload"
+                        style={{
+                          flex: 1,
+                          padding: "10px 14px",
+                          borderRadius: "8px",
+                          border: `1px dashed ${uploadedFile ? accent : T.inputBorder}`,
+                          background: uploadedFile ? (dark ? "rgba(13,110,253,0.1)" : "#e8f4ff") : T.input,
+                          color: uploadedFile ? accent : T.textMuted,
+                          fontSize: "12px",
+                          cursor: isProcessing ? "wait" : "pointer",
+                          textAlign: "center",
+                          transition: "all 0.2s",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          gap: "6px",
+                        }}
+                      >
+                        {isProcessing ? (
+                          <>Processing...</>
+                        ) : uploadedFile ? (
+                          <>📄 {uploadedFile.name}</>
+                        ) : (
+                          <>📁 Choose .docx or .pdf</>
+                        )}
+                      </label>
+                      {uploadedFile && (
+                        <button
+                          type="button"
+                          onClick={clearUpload}
+                          style={{
+                            padding: "10px 12px",
+                            borderRadius: "8px",
+                            border: `1px solid ${T.border}`,
+                            background: "transparent",
+                            color: T.textMuted,
+                            fontSize: "11px",
+                            cursor: "pointer",
+                            fontWeight: "600",
+                          }}
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                    {uploadError && (
+                      <div style={{ marginTop: "8px", fontSize: "11px", color: "#dc2626", fontWeight: "500" }}>
+                        {uploadError}
+                      </div>
+                    )}
+                    {uploadMode === "pdf" && (
+                      <div style={{ marginTop: "8px", fontSize: "11px", color: accent, fontWeight: "500" }}>
+                        PDF uploaded with {template} letterhead applied. Switch templates above to change.
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Separator when in PDF mode */}
+                  {uploadMode === "pdf" && (
+                    <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: "14px", marginTop: "-4px" }}>
+                      <p style={{ fontSize: "11px", color: T.textMuted, margin: 0 }}>
+                        Or compose a letter manually below:
+                      </p>
+                    </div>
+                  )}
+
                   {/* Body */}
                   <div>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "7px", flexWrap: "wrap", gap: "6px" }}>
@@ -590,45 +864,61 @@ export default function App() {
           >
             <div style={{ position: "sticky", top: 0, zIndex: 2, background: T.preview, paddingBottom: "12px", marginBottom: "4px", width: "100%", maxWidth: "720px", display: "flex", flexDirection: "column", gap: "10px", alignItems: "stretch" }}>
               <div style={{ fontSize: "10px", color: T.previewLabel, fontWeight: "700", letterSpacing: "0.12em", textTransform: "uppercase", paddingLeft: "4px" }}>
-                Preview · {template} Letterhead{isMultiPage ? ` · ${pages.length} pages` : ""}
+                Preview · {template} Letterhead{uploadMode === "pdf" ? " · Uploaded PDF" : isMultiPage ? ` · ${pages.length} pages` : ""}
               </div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center" }}>
-                <button type="button" onClick={() => scrollPreviewTo("first")} aria-label="Scroll to first page" style={{ padding: "5px 10px", borderRadius: "6px", border: `1px solid ${T.border}`, background: T.panel, color: T.textMuted, fontSize: "11px", cursor: "pointer", fontWeight: "500" }}>↑ First page</button>
-                <button type="button" onClick={() => scrollPreviewTo("last")} aria-label="Scroll to last page" style={{ padding: "5px 10px", borderRadius: "6px", border: `1px solid ${T.border}`, background: T.panel, color: T.textMuted, fontSize: "11px", cursor: "pointer", fontWeight: "500" }}>↓ Last page</button>
-                <span style={{ width: "1px", height: "18px", background: T.border, marginLeft: "4px" }} />
-                <span style={{ fontSize: "11px", color: T.previewLabel, marginRight: "4px" }}>Zoom:</span>
-                {[0.8, 1, 1.25].map((s) => (
-                  <button key={s} type="button" onClick={() => setPreviewScale(s)} aria-label={`Zoom ${s * 100}%`} aria-pressed={previewScale === s} style={{ padding: "5px 10px", borderRadius: "6px", border: `1px solid ${previewScale === s ? accent : T.border}`, background: previewScale === s ? (dark ? "rgba(13,110,253,0.2)" : "#e8f0fe") : T.panel, color: previewScale === s ? accent : T.textMuted, fontSize: "11px", cursor: "pointer", fontWeight: "500" }}>
-                    {s === 1 ? "100%" : `${s * 100}%`}
-                  </button>
-                ))}
-              </div>
+              {uploadMode !== "pdf" && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center" }}>
+                  <button type="button" onClick={() => scrollPreviewTo("first")} aria-label="Scroll to first page" style={{ padding: "5px 10px", borderRadius: "6px", border: `1px solid ${T.border}`, background: T.panel, color: T.textMuted, fontSize: "11px", cursor: "pointer", fontWeight: "500" }}>↑ First page</button>
+                  <button type="button" onClick={() => scrollPreviewTo("last")} aria-label="Scroll to last page" style={{ padding: "5px 10px", borderRadius: "6px", border: `1px solid ${T.border}`, background: T.panel, color: T.textMuted, fontSize: "11px", cursor: "pointer", fontWeight: "500" }}>↓ Last page</button>
+                  <span style={{ width: "1px", height: "18px", background: T.border, marginLeft: "4px" }} />
+                  <span style={{ fontSize: "11px", color: T.previewLabel, marginRight: "4px" }}>Zoom:</span>
+                  {[0.8, 1, 1.25].map((s) => (
+                    <button key={s} type="button" onClick={() => setPreviewScale(s)} aria-label={`Zoom ${s * 100}%`} aria-pressed={previewScale === s} style={{ padding: "5px 10px", borderRadius: "6px", border: `1px solid ${previewScale === s ? accent : T.border}`, background: previewScale === s ? (dark ? "rgba(13,110,253,0.2)" : "#e8f0fe") : T.panel, color: previewScale === s ? accent : T.textMuted, fontSize: "11px", cursor: "pointer", fontWeight: "500" }}>
+                      {s === 1 ? "100%" : `${s * 100}%`}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
-            <div ref={previewZoomWrapperRef} style={{ zoom: previewScale, width: "100%", maxWidth: "720px" }}>
-              <div ref={previewRef} style={{ width: "100%", display: "flex", flexDirection: "column", gap: "12px" }}>
-                {pages.map((pageBody, i) => {
-                  const isFirst = i === 0;
-                  const isLast  = i === pages.length - 1;
-                  return (
-                    <div key={i} style={{ boxShadow: pageShadow, borderRadius: "3px", overflow: "hidden" }}>
-                      {isFirst ? (
-                        <LetterheadPage
-                          bg={isHRT ? HRT_BG : TRT_BG}
-                          body={pageBody}
-                          signer={activeSigner}
-                          headerEndPct={isHRT ? 22 : 14.5}
-                          footerStartPct={89.9}
-                          isLastPage={isLast}
-                        />
-                      ) : (
-                        <ContinuationPage body={pageBody} signer={activeSigner} isLastPage={isLast} />
-                      )}
-                    </div>
-                  );
-                })}
+            {/* PDF Preview Mode */}
+            {uploadMode === "pdf" && uploadedPdfBytes ? (
+              <div style={{ width: "100%", maxWidth: "720px", flex: 1, minHeight: "600px" }}>
+                {isProcessing ? (
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "400px", color: T.textMuted }}>
+                    Processing PDF...
+                  </div>
+                ) : (
+                  <PdfPreview pdfBytes={uploadedPdfBytes} />
+                )}
               </div>
-            </div>
+            ) : (
+              /* Composed Document Preview */
+              <div ref={previewZoomWrapperRef} style={{ zoom: previewScale, width: "100%", maxWidth: "720px" }}>
+                <div ref={previewRef} style={{ width: "100%", display: "flex", flexDirection: "column", gap: "12px" }}>
+                  {pages.map((pageBody, i) => {
+                    const isFirst = i === 0;
+                    const isLast  = i === pages.length - 1;
+                    return (
+                      <div key={i} style={{ boxShadow: pageShadow, borderRadius: "3px", overflow: "hidden" }}>
+                        {isFirst ? (
+                          <LetterheadPage
+                            bg={isHRT ? HRT_BG : TRT_BG}
+                            body={pageBody}
+                            signer={activeSigner}
+                            headerEndPct={isHRT ? 22 : 14.5}
+                            footerStartPct={89.9}
+                            isLastPage={isLast}
+                          />
+                        ) : (
+                          <ContinuationPage body={pageBody} signer={activeSigner} isLastPage={isLast} />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
